@@ -1,5 +1,7 @@
 package com.example.pdfbackend;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.pdfbox.io.RandomAccessReadBuffer;
 import org.apache.pdfbox.multipdf.PDFMergerUtility;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -22,6 +24,7 @@ import org.springframework.web.multipart.MultipartFile;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.util.List;
 
 @RestController
 @RequestMapping("/api/pdf")
@@ -29,48 +32,122 @@ import java.io.IOException;
 public class PdfController {
 
     @PostMapping("/merge")
-    public ResponseEntity<byte[]> mergeFiles(@RequestParam("files") MultipartFile[] files) {
-        if (files == null || files.length == 0) {
-            return ResponseEntity.badRequest().build();
-        }
+    public ResponseEntity<byte[]> mergeFiles(
+            @RequestParam(value = "tituloPrincipal", required = false) String tituloPrincipal,
+            @RequestParam(value = "autor", required = false) String autor,
+            @RequestParam(value = "fecha", required = false) String fecha,
+            @RequestParam(value = "seccionesJson", required = false) String seccionesJson,
+            @RequestParam(value = "files", required = false) MultipartFile[] files) {
 
         try (ByteArrayOutputStream finalOutputStream = new ByteArrayOutputStream()) {
             PDFMergerUtility merger = new PDFMergerUtility();
 
-            for (MultipartFile file : files) {
-                String filename = file.getOriginalFilename() != null ? file.getOriginalFilename().toLowerCase() : "";
-                String contentType = file.getContentType();
+            // 1. Parsear el JSON de secciones dinámicas enviadas desde Angular
+            List<SectionDto> secciones = null;
+            if (seccionesJson != null && !seccionesJson.trim().isEmpty()) {
+                ObjectMapper mapper = new ObjectMapper();
+                secciones = mapper.readValue(seccionesJson, new TypeReference<List<SectionDto>>() {});
+            }
 
-                if (filename.endsWith(".pdf") || (contentType != null && contentType.equals("application/pdf"))) {
-                    merger.addSource(new RandomAccessReadBuffer(file.getBytes()));
-                } else if (filename.endsWith(".docx")) {
-                    byte[] docxPdf = convertDocxToPdfBytes(file);
-                    merger.addSource(new RandomAccessReadBuffer(docxPdf));
-                } else if (filename.endsWith(".xlsx")) {
-                    byte[] excelPdf = convertExcelToPdfBytes(file);
-                    merger.addSource(new RandomAccessReadBuffer(excelPdf));
-                } else if (contentType != null && contentType.startsWith("image/")) {
-                    byte[] imagePdf = convertImageToPdfBytes(file);
-                    merger.addSource(new RandomAccessReadBuffer(imagePdf));
+            // 2. Si se llenó el título o hay secciones dinámicas, generamos la página de la plantilla
+            if ((tituloPrincipal != null && !tituloPrincipal.trim().isEmpty()) || (secciones != null && !secciones.isEmpty())) {
+                byte[] templatePdfBytes = generateTemplatePdf(tituloPrincipal, autor, fecha, secciones);
+                merger.addSource(new RandomAccessReadBuffer(templatePdfBytes));
+            }
+
+            // 3. Añadir los archivos adjuntos (PDF, Word, Excel, Imágenes)
+            if (files != null) {
+                for (MultipartFile file : files) {
+                    String filename = file.getOriginalFilename() != null ? file.getOriginalFilename().toLowerCase() : "";
+                    String contentType = file.getContentType();
+
+                    if (filename.endsWith(".pdf") || (contentType != null && contentType.equals("application/pdf"))) {
+                        merger.addSource(new RandomAccessReadBuffer(file.getBytes()));
+                    } else if (filename.endsWith(".docx")) {
+                        merger.addSource(new RandomAccessReadBuffer(convertDocxToPdfBytes(file)));
+                    } else if (filename.endsWith(".xlsx")) {
+                        merger.addSource(new RandomAccessReadBuffer(convertExcelToPdfBytes(file)));
+                    } else if (contentType != null && contentType.startsWith("image/")) {
+                        merger.addSource(new RandomAccessReadBuffer(convertImageToPdfBytes(file)));
+                    }
                 }
             }
 
             merger.setDestinationStream(finalOutputStream);
             merger.mergeDocuments(null);
 
-            byte[] pdfBytes = finalOutputStream.toByteArray();
-
             HttpHeaders headers = new HttpHeaders();
             headers.setContentType(MediaType.APPLICATION_PDF);
             headers.setContentDispositionFormData("attachment", "documento_combinado.pdf");
 
-            return ResponseEntity.ok()
-                    .headers(headers)
-                    .body(pdfBytes);
+            return ResponseEntity.ok().headers(headers).body(finalOutputStream.toByteArray());
 
         } catch (Exception e) {
             e.printStackTrace();
             return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    // Método auxiliar para generar la página PDF con el encabezado y las secciones dinámicas
+    private byte[] generateTemplatePdf(String titulo, String autor, String fecha, List<SectionDto> secciones) throws IOException {
+        try (PDDocument doc = new PDDocument(); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+
+            PDPage page = new PDPage(PDRectangle.A4);
+            doc.addPage(page);
+            PDPageContentStream contentStream = new PDPageContentStream(doc, page);
+
+            float yPosition = 750;
+            float margin = 50;
+
+            // Imprimir Título Principal
+            contentStream.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA_BOLD), 18);
+            contentStream.beginText();
+            contentStream.newLineAtOffset(margin, yPosition);
+            contentStream.showText(titulo != null ? titulo : "Informe General");
+            contentStream.endText();
+            yPosition -= 30;
+
+            // Imprimir Autor y Fecha
+            contentStream.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA), 11);
+            contentStream.beginText();
+            contentStream.newLineAtOffset(margin, yPosition);
+            contentStream.showText("Autor: " + (autor != null ? autor : "No especificado") + " | Fecha: " + (fecha != null ? fecha : ""));
+            contentStream.endText();
+            yPosition -= 40;
+
+            // Recorrer e imprimir las secciones dinámicas creadas en la web
+            if (secciones != null) {
+                for (SectionDto sec : secciones) {
+                    // Control de salto de página automático si se acaba el espacio
+                    if (yPosition < 100) {
+                        contentStream.close();
+                        page = new PDPage(PDRectangle.A4);
+                        doc.addPage(page);
+                        contentStream = new PDPageContentStream(doc, page);
+                        yPosition = 750;
+                    }
+
+                    // Título de la sección
+                    contentStream.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA_BOLD), 13);
+                    contentStream.beginText();
+                    contentStream.newLineAtOffset(margin, yPosition);
+                    contentStream.showText(sec.getTitulo() != null ? sec.getTitulo() : "");
+                    contentStream.endText();
+                    yPosition -= 18;
+
+                    // Contenido de la sección
+                    contentStream.setFont(new PDType1Font(Standard14Fonts.FontName.HELVETICA), 11);
+                    contentStream.beginText();
+                    contentStream.newLineAtOffset(margin, yPosition);
+                    contentStream.showText(sec.getContenido() != null ? sec.getContenido() : "");
+                    contentStream.endText();
+                    yPosition -= 30;
+                }
+            }
+
+            contentStream.close();
+            doc.save(out);
+            return out.toByteArray();
         }
     }
 
