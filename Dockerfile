@@ -4,7 +4,7 @@ WORKDIR /app
 COPY pom.xml mvnw ./
 COPY .mvn .mvn
 COPY src src
-RUN ./mvnw -B -DskipTests package
+RUN chmod +x mvnw && ./mvnw -B -DskipTests package
 
 # ---- 2) Imagen de ejecución con LibreOffice ----
 FROM eclipse-temurin:17-jre
