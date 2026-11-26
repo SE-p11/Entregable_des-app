@@ -1,7 +1,6 @@
 package com.example.pdfbackend;
 
 import com.example.pdfbackend.InformeDocxBuilder.Foto;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
@@ -17,6 +16,7 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -51,13 +51,16 @@ public class InformeController {
     private static final Locale ES = Locale.forLanguageTag("es-PE");
     private static final String PLANTILLA = "plantillas/informe_afirmado_completo.docx";
 
-    /** Ruta de soffice. En Windows: C:\\Program Files\\LibreOffice\\program\\soffice.exe */
-    @Value("${libreoffice.path:soffice}")
-    private String sofficePath;
+    private final LibreOfficeConverter conversor;
+
+    public InformeController(LibreOfficeConverter conversor) {
+        this.conversor = conversor;
+    }
 
     @PostMapping(value = "/generar", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public ResponseEntity<byte[]> generar(
-            @RequestParam Map<String, String> campos,
+            @RequestParam Map<String, String> camposRecibidos,
+            @RequestParam(value = "datos", required = false) String datos,
             @RequestParam(value = "portada", required = false) MultipartFile portada,
             @RequestParam(value = "mapa", required = false) MultipartFile mapa,
             @RequestParam(value = "curva", required = false) MultipartFile curva,
@@ -66,13 +69,20 @@ public class InformeController {
             @RequestParam(value = "panelDescripcion", required = false) List<String> panelDescripcion
     ) throws IOException {
 
+        // Los textos llegan en un solo campo "datos" (formato a=1&b=2, codificado en UTF-8).
+        // Así no se supera el máximo de partes de un multipart (Tomcat acepta 50 por defecto).
+        Map<String, String> campos = new HashMap<>(camposRecibidos);
+        if (datos != null && !datos.isBlank()) {
+            campos.putAll(decodificar(datos));
+        }
         Map<String, String> valores = valores(campos);
 
         List<Foto> fotosPanel = new ArrayList<>();
         if (panel != null) {
             for (int i = 0; i < panel.size(); i++) {
                 if (panel.get(i).isEmpty()) continue;
-                String desc = (panelDescripcion != null && i < panelDescripcion.size()) ? panelDescripcion.get(i) : "";
+                String desc = campos.containsKey("panelDesc" + i) ? campos.get("panelDesc" + i)
+                        : (panelDescripcion != null && i < panelDescripcion.size()) ? panelDescripcion.get(i) : "";
                 fotosPanel.add(new Foto(panel.get(i).getBytes(), desc));
             }
         }
@@ -101,12 +111,32 @@ public class InformeController {
                 .body(salida);
     }
 
+    /** Falta plantilla, LibreOffice no está instalado, etc. => 500 con mensaje corto y legible. */
+    @ExceptionHandler(IOException.class)
+    public ResponseEntity<String> falloInterno(IOException e) {
+        String msg = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+        if (msg.length() > 280) msg = msg.substring(0, 280);
+        return ResponseEntity.internalServerError().contentType(MediaType.TEXT_PLAIN).body(msg);
+    }
+
     /** Imagen inválida (por ejemplo WEBP) => 400 con mensaje legible. */
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<String> imagenInvalida(IllegalArgumentException e) {
         return ResponseEntity.badRequest()
                 .contentType(MediaType.TEXT_PLAIN)
                 .body(e.getMessage());
+    }
+
+    private static Map<String, String> decodificar(String datos) {
+        Map<String, String> m = new HashMap<>();
+        for (String par : datos.split("&")) {
+            if (par.isEmpty()) continue;
+            int i = par.indexOf('=');
+            String k = URLDecoder.decode(i < 0 ? par : par.substring(0, i), StandardCharsets.UTF_8);
+            String v = i < 0 ? "" : URLDecoder.decode(par.substring(i + 1), StandardCharsets.UTF_8);
+            m.put(k, v);
+        }
+        return m;
     }
 
     // ------------------------------------------------------------ valores
@@ -191,37 +221,12 @@ public class InformeController {
 
     // ---------------------------------------------------------------- PDF
 
-    /**
-     * Convierte con LibreOffice. Si tu LibreOfficeConverter ya hace esto,
-     * puedes reemplazar el cuerpo por una llamada a ese servicio.
-     */
     private byte[] convertirAPdf(byte[] docx) throws IOException {
-        Path dir = Files.createTempDirectory("informe_");
         try {
-            Path entrada = dir.resolve("informe.docx");
-            Files.write(entrada, docx);
-            Process proc = new ProcessBuilder(
-                    sofficePath, "--headless",
-                    "-env:UserInstallation=" + dir.resolve("perfil").toUri(),
-                    "--convert-to", "pdf", "--outdir", dir.toString(), entrada.toString())
-                    .redirectErrorStream(true).start();
-            String log = new String(proc.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-            if (!proc.waitFor(180, TimeUnit.SECONDS)) {
-                proc.destroyForcibly();
-                throw new IOException("LibreOffice tardó demasiado en convertir el informe.");
-            }
-            Path pdf = dir.resolve("informe.pdf");
-            if (!Files.exists(pdf)) {
-                throw new IOException("LibreOffice no generó el PDF. Salida: " + log);
-            }
-            return Files.readAllBytes(pdf);
+            return conversor.toPdf(docx, "docx");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("Conversión interrumpida", e);
-        } finally {
-            try (Stream<Path> s = Files.walk(dir)) {
-                s.sorted(Comparator.reverseOrder()).forEach(q -> q.toFile().delete());
-            }
         }
     }
 }
