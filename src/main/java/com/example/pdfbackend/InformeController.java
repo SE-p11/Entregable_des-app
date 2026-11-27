@@ -18,18 +18,13 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.time.LocalDate;
 import java.time.format.TextStyle;
 import java.util.ArrayList;
-import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Stream;
 
 /**
  * POST /api/informe/generar  (multipart/form-data)
@@ -49,7 +44,10 @@ import java.util.stream.Stream;
 public class InformeController {
 
     private static final Locale ES = Locale.forLanguageTag("es-PE");
-    private static final String PLANTILLA = "plantillas/informe_afirmado_completo.docx";
+    /** Modelo "material": control de calidad de material para afirmado (cantera, pista, carretera...). */
+    private static final String PLANTILLA_MATERIAL = "plantillas/informe_afirmado_completo.docx";
+    /** Modelo "cimentacion": estudio de mecánica de suelos con fines de cimentación (casa, puente...). */
+    private static final String PLANTILLA_EMS = "plantillas/informe_cimentacion.docx";
 
     private final LibreOfficeConverter conversor;
 
@@ -94,7 +92,7 @@ public class InformeController {
         }
 
         byte[] docx;
-        try (InputStream plantilla = new ClassPathResource(PLANTILLA).getInputStream()) {
+        try (InputStream plantilla = new ClassPathResource("cimentacion".equalsIgnoreCase(campos.get("modelo")) ? PLANTILLA_EMS : PLANTILLA_MATERIAL).getInputStream()) {
             docx = new InformeDocxBuilder().generar(plantilla, valores,
                     foto(portada), foto(mapa), foto(curva), fotosAnexo, fotosPanel);
         }
@@ -150,9 +148,9 @@ public class InformeController {
         v.put("DOSIFICACION", limpio(p.get("dosificacion")));
         v.put("OBRA", mayus(sinComillas(p.get("obra"))));
         v.put("TIPO_PROYECTO", mayus(p.get("tipoProyecto")));
+        v.put("TIPO_CAP", capitalizar(p.get("tipoProyecto")));
         v.put("CANTERA", cantera);
         v.put("SOLICITA", mayus(p.get("solicita")));
-        v.put("REALIZADO_POR", mayus(p.get("realizadoPor")));
         v.put("LUGAR", mayus(p.get("lugar")));
         v.put("DISTRITO", mayus(p.get("distrito")));
         v.put("PROVINCIA", mayus(p.get("provincia")));
@@ -166,9 +164,18 @@ public class InformeController {
         v.put("CANT_DISTRITO", limpio(p.get("cantDistrito")));
         v.put("CANT_LUGAR", limpio(p.get("cantLugar")));
         String punto = limpio(p.get("puntoReferencia"));
-        v.put("PUNTO_REFERENCIA", punto.isEmpty() ? "Cantera " + cantera : punto);
+        v.put("PUNTO_REFERENCIA", punto.isEmpty() ? v.get("TIPO_CAP") + " " + cantera : punto);
         v.put("ESTE", limpio(p.get("este")));
         v.put("NORTE", limpio(p.get("norte")));
+
+        // resultados opcionales: si quedan vacíos, la fila completa desaparece de la tabla del informe
+        for (String[] par : new String[][]{
+                {"OPC_CBR", "cbr"}, {"OPC_ABRASION", "abrasion"},
+                {"OPC_DF", "df"}, {"OPC_ANCHO_B", "anchoB"}, {"OPC_GAMMA", "gamma"}, {"OPC_COHESION", "cohesion"},
+                {"OPC_PHI", "phi"}, {"OPC_QADM", "qadm"}, {"OPC_ASENTAMIENTO", "asentamiento"},
+                {"OPC_NIVEL_FREATICO", "nivelFreatico"}, {"OPC_METODO", "metodoCapacidad"}}) {
+            v.put(par[0], limpio(p.get(par[1])));
+        }
 
         // ensayos
         for (String[] par : new String[][]{
@@ -181,12 +188,59 @@ public class InformeController {
         }
         v.put("SUCS", v.get("SUCS").toUpperCase(ES));
         v.put("NOMBRE_GRUPO", v.get("NOMBRE_GRUPO").toUpperCase(ES));
-        v.put("CONCLUSION", limpio(p.get("conclusion")));
+
+        // ---- títulos de sección (se usan igual en el índice y en el cuerpo) ----
+        for (String[] par : new String[][]{
+                {"T_COMENTARIOS", "tComentarios"}, {"T_ENSAYOS", "tEnsayos"}, {"T_UBICACION", "tUbicacion"},
+                {"T_GRANULOMETRIA", "tGranulometria"}, {"T_LIMITES", "tLimites"}, {"T_PROCTOR", "tProctor"},
+                {"T_MANIPULEO", "tManipuleo"}, {"T_CONCLUSIONES", "tConclusiones"}, {"ENCABEZADO", "encabezado"},
+                {"T_PERFIL", "tPerfil"}, {"T_CAPACIDAD", "tCapacidad"}}) {
+            v.put(par[0], mayus(p.get(par[1])));
+        }
+
+        // ---- bloques de texto: una línea = un párrafo. Las claves {cantera}, {dosificacion}... se reemplazan ----
+        Map<String, String> claves = new HashMap<>();
+        claves.put("{cantera}", dato(cantera));
+        claves.put("{nombre}", dato(cantera));
+        claves.put("{tipo}", dato(v.get("TIPO_CAP")));
+        for (String[] par : new String[][]{
+                {"{dosificacion}", "DOSIFICACION"}, {"{zaranda}", "ZARANDA"}, {"{gradacion}", "GRADACION"},
+                {"{aashto}", "AASHTO"}, {"{sucs}", "SUCS"}, {"{nombreGrupo}", "NOMBRE_GRUPO"}, {"{ig}", "IG"},
+                {"{muestra}", "MUESTRA"}, {"{grava}", "GRAVA"}, {"{arena}", "ARENA"}, {"{finos}", "FINOS"},
+                {"{humedad}", "HUMEDAD"}, {"{cu}", "CU"}, {"{cc}", "CC"},
+                {"{ll}", "LL"}, {"{lp}", "LP"}, {"{ip}", "IP"}, {"{mds}", "MDS"}, {"{och}", "OCH"},
+                {"{cbr}", "OPC_CBR"}, {"{abrasion}", "OPC_ABRASION"},
+                {"{df}", "OPC_DF"}, {"{b}", "OPC_ANCHO_B"}, {"{gamma}", "OPC_GAMMA"}, {"{c}", "OPC_COHESION"},
+                {"{phi}", "OPC_PHI"}, {"{qadm}", "OPC_QADM"}, {"{asentamiento}", "OPC_ASENTAMIENTO"},
+                {"{nivelFreatico}", "OPC_NIVEL_FREATICO"}, {"{metodo}", "OPC_METODO"}}) {
+            claves.put(par[0], dato(v.get(par[1])));
+        }
+        claves.put("{profCalicata}", dato(limpio(p.get("profCalicata"))));
+        for (String[] par : new String[][]{
+                {"TXT_COMENTARIOS", "txtComentarios"}, {"TXT_ENSAYOS_INTRO", "txtEnsayosIntro"},
+                {"TXT_ENSAYOS_NORMAS", "txtEnsayosNormas"}, {"TXT_GRANULOMETRIA", "txtGranulometria"},
+                {"TXT_CLASIFICACION", "txtClasificacion"}, {"TXT_GRADACION", "txtGradacion"},
+                {"TXT_CURVA", "txtCurva"}, {"TXT_LIMITES", "txtLimites"}, {"TXT_INDICE_GRUPO", "txtIndiceGrupo"},
+                {"TXT_PROCTOR", "txtProctor"}, {"TXT_MANIPULEO", "txtManipuleo"},
+                {"TXT_CONCLUSIONES_INTRO", "txtConclusionesIntro"}, {"TXT_PERFIL", "txtPerfil"}, {"TXT_CAPACIDAD", "txtCapacidad"},
+                {"TXT_CONCLUSION", "conclusion"},
+                {"TXT_RECOMENDACION", "recomendacion"}}) {
+            String texto = limpio(p.get(par[1]));
+            for (Map.Entry<String, String> c : claves.entrySet()) {
+                texto = texto.replace(c.getKey(), c.getValue());
+            }
+            v.put(par[0], texto);
+        }
         return v;
     }
 
     private static Foto foto(MultipartFile f) throws IOException {
         return (f == null || f.isEmpty()) ? null : new Foto(f.getBytes(), null);
+    }
+
+    /** Dato que falta => "—", para que en el informe se note que hay algo por completar. */
+    private static String dato(String s) {
+        return s == null || s.isBlank() ? "—" : s;
     }
 
     private static String limpio(String s) {

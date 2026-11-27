@@ -67,7 +67,11 @@ public class InformeDocxBuilder {
                 "<w:p><w:r><w:t>{{PANEL_FOTOGRAFICO}}</w:t></w:r></w:p>",
                 bloquePanel(panel));
 
-        // 3) textos
+        // 3) bloques de texto de varias líneas: cada línea = un párrafo con el formato del original
+        quitarFilasOpcionales(valores);
+        expandirBloques(valores);
+
+        // 4) textos
         Matcher m = Pattern.compile("\\{\\{([A-Z0-9_]+)}}").matcher(documentXml);
         StringBuilder sb = new StringBuilder();
         while (m.find()) {
@@ -78,6 +82,60 @@ public class InformeDocxBuilder {
         documentXml = sb.toString();
 
         return empaquetar();
+    }
+
+    // ------------------------------------------------------------------ filas opcionales
+
+    /**
+     * Los marcadores {{OPC_...}} están dentro de una fila de tabla. Si el usuario dejó ese dato vacío,
+     * la fila completa se quita (por ejemplo, la fila de CBR cuando no se hizo ese ensayo).
+     */
+    private void quitarFilasOpcionales(Map<String, String> valores) {
+        Matcher m = Pattern.compile("\\{\\{(OPC_[A-Z0-9_]+)}}").matcher(documentXml);
+        java.util.Set<String> vacios = new java.util.LinkedHashSet<>();
+        while (m.find()) {
+            if (valores.getOrDefault(m.group(1), "").isBlank()) vacios.add(m.group(1));
+        }
+        for (String clave : vacios) {
+            String marcador = "{{" + clave + "}}";
+            int idx;
+            while ((idx = documentXml.indexOf(marcador)) >= 0) {
+                int ini = Math.max(documentXml.lastIndexOf("<w:tr>", idx), documentXml.lastIndexOf("<w:tr ", idx));
+                int fin = documentXml.indexOf("</w:tr>", idx) + "</w:tr>".length();
+                documentXml = documentXml.substring(0, ini) + documentXml.substring(fin);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ bloques de texto
+
+    /**
+     * Los marcadores {{TXT_...}} están solos en un párrafo de la plantilla. Aquí ese párrafo se copia
+     * una vez por cada línea escrita por el usuario (las líneas vacías se ignoran). Así cada línea sale
+     * como un párrafo real, con la misma justificación, viñeta y fuente que tenía el texto original.
+     */
+    private void expandirBloques(Map<String, String> valores) {
+        Pattern marcador = Pattern.compile("\\{\\{(TXT_[A-Z0-9_]+)}}");
+        while (true) {
+            Matcher m = marcador.matcher(documentXml);
+            if (!m.find()) return;
+
+            int ini = Math.max(documentXml.lastIndexOf("<w:p>", m.start()),
+                               documentXml.lastIndexOf("<w:p ", m.start()));
+            int fin = documentXml.indexOf("</w:p>", m.end()) + "</w:p>".length();
+            // los identificadores internos (paraId/textId) no pueden repetirse entre párrafos: se quitan
+            String parrafo = documentXml.substring(ini, fin)
+                    .replaceAll("\\s+w14:(?:paraId|textId)=\"[^\"]*\"", "");
+
+            StringBuilder copias = new StringBuilder();
+            for (String linea : valores.getOrDefault(m.group(1), "").split("\\R")) {
+                if (linea.isBlank()) continue;
+                // "{{" dentro del texto del usuario no debe volver a interpretarse como marcador
+                String seguro = linea.trim().replace("{{", "{ {");
+                copias.append(parrafo.replace(m.group(), aXml(seguro)));
+            }
+            documentXml = documentXml.substring(0, ini) + copias + documentXml.substring(fin);
+        }
     }
 
     // ------------------------------------------------------------------ zip
